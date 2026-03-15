@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"strings"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -198,17 +199,23 @@ func (r *TemplateChainReconciler) reconcileObj(ctx context.Context, tplChain tem
 				spec.Helm = &kcmv1.HelmSpec{ChartRef: serviceTemplate.Status.ChartRef}
 			} else {
 				status := serviceTemplate.Status.SourceStatus
-				// we won't allow cross-namespace references to sources of the type of ConfigMap/Secret
-				// as this may lead to a security breach.
-				if status.Kind == kcmv1.SecretKind || status.Kind == kcmv1.ConfigMapKind {
-					return fmt.Errorf("source of a kind %s cannot be populated across namespaces", status.Kind)
+				if status.Kind == kcmv1.SecretKind {
+					return fmt.Errorf("source of kind %s cannot be populated across namespaces", status.Kind)
 				}
-				// in opposite we allow cross-namespace references to sources of the type of GitRepository,
-				// Bucket or OCIRepository, as possible secrets won't be directly exposed to the user.
+
 				sourceRef := &kcmv1.LocalSourceRef{
 					Kind:      status.Kind,
 					Name:      status.Name,
 					Namespace: status.Namespace,
+				}
+
+				if status.Kind == kcmv1.ConfigMapKind {
+					copiedCM, err := r.copyConfigMap(ctx, status.Namespace, status.Name, tplChain)
+					if err != nil {
+						return fmt.Errorf("failed to copy ConfigMap %s/%s to namespace %s: %w", status.Namespace, status.Name, tplChain.GetNamespace(), err)
+					}
+					sourceRef.Name = copiedCM.Name
+					sourceRef.Namespace = copiedCM.Namespace
 				}
 				if serviceTemplate.Spec.Helm != nil {
 					spec.Helm.ChartSource.RemoteSourceSpec = nil
@@ -287,6 +294,53 @@ func (r *TemplateChainReconciler) updateStatus(ctx context.Context, obj client.O
 	}
 
 	return nil
+}
+
+func (r *TemplateChainReconciler) copyConfigMap(ctx context.Context, sourceNamespace, sourceName string, owner templateChain) (*corev1.ConfigMap, error) {
+	l := ctrl.LoggerFrom(ctx)
+	targetNamespace := owner.GetNamespace()
+
+	sourceCM := &corev1.ConfigMap{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: sourceNamespace, Name: sourceName}, sourceCM); err != nil {
+		return nil, fmt.Errorf("failed to get source ConfigMap: %w", err)
+	}
+
+	targetCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      sourceName,
+			Namespace: targetNamespace,
+			Labels: map[string]string{
+				kcmv1.KCMManagedLabelKey: kcmv1.KCMManagedLabelValue,
+			},
+		},
+	}
+
+	operation, err := ctrl.CreateOrUpdate(ctx, r.Client, targetCM, func() error {
+		targetCM.Data = sourceCM.Data
+		targetCM.BinaryData = sourceCM.BinaryData
+		if sourceCM.Annotations != nil {
+			targetCM.Annotations = make(map[string]string, len(sourceCM.Annotations))
+			for k, v := range sourceCM.Annotations {
+				targetCM.Annotations[k] = v
+			}
+		} else {
+			targetCM.Annotations = nil
+		}
+		kubeutil.AddOwnerReference(targetCM, owner)
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create or update ConfigMap: %w", err)
+	}
+
+	if operation == controllerutil.OperationResultCreated {
+		l.Info("ConfigMap was successfully copied", "source", sourceNamespace+"/"+sourceName, "target", targetNamespace+"/"+sourceName)
+	}
+	if operation == controllerutil.OperationResultUpdated {
+		l.Info("ConfigMap was successfully updated", "target", targetNamespace+"/"+sourceName)
+	}
+
+	return targetCM, nil
 }
 
 func getTemplateNamesManagedByChain(chain templateChain) []string {
