@@ -618,7 +618,7 @@ func (r *ServiceSetReconciler) profileSpec(ctx context.Context, rgnClient client
 	if err != nil {
 		return nil, errors.Join(errBuildKustomizationRefsFailed, err)
 	}
-	policyRefs, err := getPolicyRefs(ctx, r.Client, serviceSet)
+	policyRefs, err := getPolicyRefs(ctx, r.Client, serviceSet, r.SystemNamespace)
 	if err != nil {
 		return nil, errors.Join(errBuildPolicyRefsFailed, err)
 	}
@@ -1116,12 +1116,35 @@ func getKustomizationRefs(ctx context.Context, c client.Client, serviceSet *kcmv
 	return kustomizationRefs, nil
 }
 
+// resolvePolicyRefNamespace returns the namespace where the policy ref resource (ConfigMap or Secret)
+// exists: it tries preferredNamespace first (e.g. ClusterDeployment namespace), then systemNamespace.
+func resolvePolicyRefNamespace(ctx context.Context, c client.Client, kind, name, preferredNamespace, systemNamespace string) (string, error) {
+	for _, ns := range []string{preferredNamespace, systemNamespace} {
+		if ns == "" {
+			continue
+		}
+		var obj client.Object
+		switch kind {
+		case "ConfigMap":
+			obj = &corev1.ConfigMap{}
+		case "Secret":
+			obj = &corev1.Secret{}
+		default:
+			return preferredNamespace, nil
+		}
+		if err := c.Get(ctx, client.ObjectKey{Namespace: ns, Name: name}, obj); err == nil {
+			return ns, nil
+		}
+	}
+	return "", fmt.Errorf("%s %s not found in namespace %s or %s", kind, name, preferredNamespace, systemNamespace)
+}
+
 // getPolicyRefs returns a list of PolicyRefs for the given services.
-func getPolicyRefs(ctx context.Context, c client.Client, serviceSet *kcmv1.ServiceSet) ([]addoncontrollerv1beta1.PolicyRef, error) {
+func getPolicyRefs(ctx context.Context, c client.Client, serviceSet *kcmv1.ServiceSet, systemNamespace string) ([]addoncontrollerv1beta1.PolicyRef, error) {
 	policyRefs := make([]addoncontrollerv1beta1.PolicyRef, 0)
 	namespace := serviceSet.Namespace
 	for _, svc := range serviceSet.Spec.Services {
-		tmpl, err := serviceTemplateObjectFromService(ctx, c, svc, namespace)
+		tmpl, err := serviceTemplateObjectFromServiceWithFallback(ctx, c, svc, namespace, systemNamespace)
 		if err != nil {
 			return nil, err
 		}
@@ -1134,10 +1157,16 @@ func getPolicyRefs(ctx context.Context, c client.Client, serviceSet *kcmv1.Servi
 			continue
 		}
 
+		status := tmpl.Status.SourceStatus
+		refNamespace := status.Namespace
+		if resolved, err := resolvePolicyRefNamespace(ctx, c, status.Kind, status.Name, namespace, systemNamespace); err == nil {
+			refNamespace = resolved
+		}
+
 		policyRef := addoncontrollerv1beta1.PolicyRef{
-			Namespace:      tmpl.Status.SourceStatus.Namespace,
-			Name:           tmpl.Status.SourceStatus.Name,
-			Kind:           tmpl.Status.SourceStatus.Kind,
+			Namespace:      refNamespace,
+			Name:           status.Name,
+			Kind:           status.Kind,
 			Path:           tmpl.Spec.Resources.Path,
 			DeploymentType: addoncontrollerv1beta1.DeploymentType(tmpl.Spec.Resources.DeploymentType),
 		}
@@ -1162,6 +1191,27 @@ func getPolicyRefs(ctx context.Context, c client.Client, serviceSet *kcmv1.Servi
 	return policyRefs, nil
 }
 
+// serviceTemplateObjectFromServiceWithFallback returns the ServiceTemplate for the given service,
+// trying the preferred namespace (e.g. ClusterDeployment namespace) first, then systemNamespace.
+func serviceTemplateObjectFromServiceWithFallback(
+	ctx context.Context,
+	cl client.Client,
+	svc kcmv1.ServiceWithValues,
+	preferredNamespace, systemNamespace string,
+) (*kcmv1.ServiceTemplate, error) {
+	template := new(kcmv1.ServiceTemplate)
+	for _, ns := range []string{preferredNamespace, systemNamespace} {
+		if ns == "" {
+			continue
+		}
+		key := client.ObjectKey{Name: svc.Template, Namespace: ns}
+		if err := cl.Get(ctx, key, template); err == nil {
+			return template, nil
+		}
+	}
+	return nil, fmt.Errorf("failed to get ServiceTemplate %s in namespace %s or %s", svc.Template, preferredNamespace, systemNamespace)
+}
+
 // serviceTemplateObjectFromService returns the [github.com/K0rdent/kcm/api/v1beta1.ServiceTemplate]
 // object found either by direct reference or in [github.com/K0rdent/kcm/api/v1beta1.ServiceTemplateChain] by defined version.
 func serviceTemplateObjectFromService(
@@ -1170,12 +1220,7 @@ func serviceTemplateObjectFromService(
 	svc kcmv1.ServiceWithValues,
 	namespace string,
 ) (*kcmv1.ServiceTemplate, error) {
-	template := new(kcmv1.ServiceTemplate)
-	key := client.ObjectKey{Name: svc.Template, Namespace: namespace}
-	if err := cl.Get(ctx, key, template); err != nil {
-		return nil, fmt.Errorf("failed to get ServiceTemplate %s: %w", key.String(), err)
-	}
-	return template, nil
+	return serviceTemplateObjectFromServiceWithFallback(ctx, cl, svc, namespace, "")
 }
 
 // convertValuesFrom converts [github.com/K0rdent/kcm/api/v1beta1.ValuesFrom]

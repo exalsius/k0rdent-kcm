@@ -132,8 +132,11 @@ func collectClusterIdentities(ctx context.Context, mgmtClient, rgnClient client.
 	objKey := client.ObjectKey{Name: cred.Spec.IdentityRef.Name}
 	if cred.Spec.IdentityRef.Namespace != "" {
 		if cred.Spec.IdentityRef.Kind == "Secret" {
-			// for Secret-based identities, use the namespace from the identityRef as the source of truth
+			// for Secret-based identities, try identityRef.Namespace first, then systemNamespace
 			objKey = client.ObjectKey{Namespace: cred.Spec.IdentityRef.Namespace, Name: cred.Spec.IdentityRef.Name}
+			if err := mgmtClient.Get(ctx, objKey, clIdty); err != nil && apierrors.IsNotFound(err) && systemNamespace != "" {
+				objKey = client.ObjectKey{Namespace: systemNamespace, Name: cred.Spec.IdentityRef.Name}
+			}
 		} else {
 			// for non-Secret identities, we expect the original identity to exist in the system namespace
 			objKey = client.ObjectKey{Namespace: systemNamespace, Name: cred.Spec.IdentityRef.Name}
