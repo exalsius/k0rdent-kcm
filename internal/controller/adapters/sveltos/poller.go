@@ -70,7 +70,7 @@ func (p *Poller) pollClusterSummaries(ctx context.Context) {
 				}
 
 				serviceSet := item.DeepCopy()
-				rgnClient, err := getRegionalClient(ctx, p.Client, serviceSet, p.systemNamespace)
+				rgnClient, _, err := getRegionalClient(ctx, p.Client, serviceSet, p.systemNamespace)
 				if err != nil {
 					logger.V(1).Error(err, "failed to get regional client")
 					continue

@@ -131,7 +131,7 @@ func (r *ServiceSetReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, err
 	}
 
-	rgnClient, err := getRegionalClient(ctx, r.Client, serviceSet, r.SystemNamespace)
+	rgnClient, isRegional, err := getRegionalClient(ctx, r.Client, serviceSet, r.SystemNamespace)
 	if err != nil {
 		l.Error(err, "failed to get regional client")
 		return ctrl.Result{}, err
@@ -208,7 +208,7 @@ func (r *ServiceSetReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	}
 
 	// first we'll ensure the profile exists and up-to-date
-	if err = r.ensureProfile(ctx, rgnClient, serviceSet); err != nil {
+	if err = r.ensureProfile(ctx, rgnClient, isRegional, serviceSet); err != nil {
 		conditionOldState := apimeta.FindStatusCondition(clone.Status.Conditions, kcmv1.ServiceSetProfileCondition)
 		conditionNewState := apimeta.FindStatusCondition(serviceSet.Status.Conditions, kcmv1.ServiceSetProfileCondition)
 		// we'll emit ServiceSetEnsureProfileFailedEvent warning
@@ -399,7 +399,7 @@ func (r *ServiceSetReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 // ensureProfile ensures that a [github.com/projectsveltos/addon-controller/api/v1beta1.Profile]
 // object exists for a given [github.com/K0rdent/kcm/api/v1beta1.ServiceSet].
-func (r *ServiceSetReconciler) ensureProfile(ctx context.Context, rgnClient client.Client, serviceSet *kcmv1.ServiceSet) error {
+func (r *ServiceSetReconciler) ensureProfile(ctx context.Context, rgnClient client.Client, isRegional bool, serviceSet *kcmv1.ServiceSet) error {
 	start := time.Now()
 	l := ctrl.LoggerFrom(ctx)
 	l.Info("Ensuring ProjectSveltos Profile")
@@ -447,7 +447,7 @@ func (r *ServiceSetReconciler) ensureProfile(ctx context.Context, rgnClient clie
 			return fmt.Errorf("failed to create or update ClusterProfile: %w", err)
 		}
 	} else {
-		if err = r.createOrUpdateProfile(ctx, rgnClient, serviceSet, spec); err != nil {
+		if err = r.createOrUpdateProfile(ctx, rgnClient, isRegional, serviceSet, spec); err != nil {
 			return fmt.Errorf("failed to create or update Profile: %w", err)
 		}
 	}
@@ -458,9 +458,7 @@ func (r *ServiceSetReconciler) ensureProfile(ctx context.Context, rgnClient clie
 	return nil
 }
 
-func (*ServiceSetReconciler) createOrUpdateProfile(ctx context.Context, rgnClient client.Client, serviceSet *kcmv1.ServiceSet, spec *addoncontrollerv1beta1.Spec) error {
-	ownerReference := metav1.NewControllerRef(serviceSet, kcmv1.GroupVersion.WithKind(kcmv1.ServiceSetKind))
-
+func (*ServiceSetReconciler) createOrUpdateProfile(ctx context.Context, rgnClient client.Client, isRegional bool, serviceSet *kcmv1.ServiceSet, spec *addoncontrollerv1beta1.Spec) error {
 	profile := new(addoncontrollerv1beta1.Profile)
 	key := client.ObjectKeyFromObject(serviceSet)
 	err := rgnClient.Get(ctx, key, profile)
@@ -469,6 +467,11 @@ func (*ServiceSetReconciler) createOrUpdateProfile(ctx context.Context, rgnClien
 	if client.IgnoreNotFound(err) != nil {
 		return fmt.Errorf("failed to get Profile: %w", err)
 	}
+
+	// When the Profile is created on a remote regional cluster, an ownerReference
+	// to the management-cluster ServiceSet is a dangling cross-cluster reference,
+	// so it must not be set. Deletion is handled explicitly via reconcileDelete.
+	desiredOwnerRefs := desiredProfileOwnerRefs(isRegional, serviceSet, profile.OwnerReferences)
 
 	annotationsUpdated := handlePauseAnnotations(&profile.ObjectMeta, serviceSet)
 
@@ -481,7 +484,7 @@ func (*ServiceSetReconciler) createOrUpdateProfile(ctx context.Context, rgnClien
 		profile.Labels = map[string]string{
 			kcmv1.KCMManagedLabelKey: kcmv1.KCMManagedLabelValue,
 		}
-		profile.OwnerReferences = []metav1.OwnerReference{*ownerReference}
+		profile.OwnerReferences = desiredOwnerRefs
 		profile.Spec = *spec
 		if err = rgnClient.Create(ctx, profile); err != nil {
 			return fmt.Errorf("failed to create Profile for ServiceSet %s: %w", serviceSet.Name, err)
@@ -489,8 +492,13 @@ func (*ServiceSetReconciler) createOrUpdateProfile(ctx context.Context, rgnClien
 	// If profile spec is not equal to the spec we just created so
 	// we need to update it. Make sure that the empty values in `spec`
 	// are defaulted otherwise comparison will always return false.
-	case annotationsUpdated || !equality.Semantic.DeepEqual(profile.Spec, *spec):
-		profile.OwnerReferences = []metav1.OwnerReference{*ownerReference}
+	// We also update when the ownerReferences drift from the desired set, so
+	// existing Profiles carrying a dangling cross-cluster ownerReference get it
+	// stripped on the next reconcile.
+	case annotationsUpdated ||
+		!equality.Semantic.DeepEqual(profile.Spec, *spec) ||
+		!equality.Semantic.DeepEqual(profile.OwnerReferences, desiredOwnerRefs):
+		profile.OwnerReferences = desiredOwnerRefs
 		profile.Spec = *spec
 		if err = rgnClient.Update(ctx, profile); err != nil {
 			return fmt.Errorf("failed to update Profile for ServiceSet %s: %w", serviceSet.Name, err)
@@ -499,6 +507,41 @@ func (*ServiceSetReconciler) createOrUpdateProfile(ctx context.Context, rgnClien
 	return nil
 }
 
+// desiredProfileOwnerRefs returns the ownerReferences a sveltos Profile should
+// carry for the given ServiceSet. It always strips any existing controller
+// reference to a ServiceSet from current (so a stale cross-cluster reference is
+// removed), then:
+//   - for a local (management-cluster) Profile, appends the ServiceSet as the
+//     controller reference (valid same-cluster owner, used for GC cascade);
+//   - for a Profile on a remote regional cluster, adds no ServiceSet reference,
+//     since a cross-cluster ownerReference would dangle and break the regional
+//     garbage collector. Deletion is handled explicitly via the ServiceSet
+//     finalizer (reconcileDelete -> rgnClient.Delete).
+func desiredProfileOwnerRefs(isRegional bool, serviceSet *kcmv1.ServiceSet, current []metav1.OwnerReference) []metav1.OwnerReference {
+	desired := make([]metav1.OwnerReference, 0, len(current))
+	for _, ref := range current {
+		if isServiceSetOwnerRef(ref) {
+			continue
+		}
+		desired = append(desired, ref)
+	}
+	if isRegional {
+		return desired
+	}
+	return append(desired, *metav1.NewControllerRef(serviceSet, kcmv1.GroupVersion.WithKind(kcmv1.ServiceSetKind)))
+}
+
+// isServiceSetOwnerRef reports whether the ownerReference points to a kcm
+// ServiceSet.
+func isServiceSetOwnerRef(ref metav1.OwnerReference) bool {
+	return ref.Kind == kcmv1.ServiceSetKind && ref.APIVersion == kcmv1.GroupVersion.String()
+}
+
+// createOrUpdateClusterProfile handles the self-management case, which always
+// targets the management cluster (the self-managing ServiceSet has an empty
+// .spec.cluster, so rgnClient is the management client). The ServiceSet and the
+// ClusterProfile are therefore co-located and the ownerReference is a valid
+// same-cluster reference, so it is intentionally kept here.
 func (*ServiceSetReconciler) createOrUpdateClusterProfile(ctx context.Context, rgnClient client.Client, serviceSet *kcmv1.ServiceSet, spec *addoncontrollerv1beta1.Spec) error {
 	ownerReference := metav1.NewControllerRef(serviceSet, kcmv1.GroupVersion.WithKind(kcmv1.ServiceSetKind))
 
@@ -1693,32 +1736,43 @@ func servicesStateFromSummary(
 }
 
 // getRegionalClient returns local or regional kubernetes client depending on the target cluster type.
-func getRegionalClient(ctx context.Context, cl client.Client, serviceSet *kcmv1.ServiceSet, systemNamespace string) (client.Client, error) {
+// getRegionalClient returns the client used to manage the ProjectSveltos objects
+// for the given ServiceSet, along with a boolean indicating whether that client
+// targets a remote regional cluster (true) rather than the local management
+// cluster (false). The distinction matters because objects created on a remote
+// regional cluster must not carry an ownerReference to the management-cluster
+// ServiceSet, which would be a dangling cross-cluster reference.
+func getRegionalClient(ctx context.Context, cl client.Client, serviceSet *kcmv1.ServiceSet, systemNamespace string) (client.Client, bool, error) {
 	if serviceSet.Spec.Cluster == "" {
 		// The ServiceSet created for self-managing the management cluster has
 		// empty .spec.cluster because it isn't matching any ClusterDeployment.
 		// So we return the management cluster client in this case.
-		return cl, nil
+		return cl, false, nil
 	}
 
 	cd := new(kcmv1.ClusterDeployment)
 	cdKey := client.ObjectKey{Namespace: serviceSet.Namespace, Name: serviceSet.Spec.Cluster}
 	if err := cl.Get(ctx, cdKey, cd); err != nil {
-		return nil, fmt.Errorf("failed to get %s ClusterDeployment: %w", cdKey, err)
+		return nil, false, fmt.Errorf("failed to get %s ClusterDeployment: %w", cdKey, err)
 	}
 
 	cred := new(kcmv1.Credential)
 	credKey := client.ObjectKey{Namespace: cd.Namespace, Name: cd.Spec.Credential}
 	if err := cl.Get(ctx, credKey, cred); err != nil {
-		return nil, fmt.Errorf("failed to get %s Credential: %w", credKey, err)
+		return nil, false, fmt.Errorf("failed to get %s Credential: %w", credKey, err)
 	}
+
+	// A non-empty region means GetRegionalClientByRegionName returns a client for
+	// a separate regional cluster; an empty region means it returns the management
+	// client (see GetRegionalClientByRegionName).
+	isRegional := cred.Spec.Region != ""
 
 	rgnClient, err := kubeutil.GetRegionalClientByRegionName(ctx, cl, systemNamespace, cred.Spec.Region, schemeutil.GetRegionalSchemeWithSveltos)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get regional client: %w", err)
+		return nil, false, fmt.Errorf("failed to get regional client: %w", err)
 	}
 
-	return rgnClient, nil
+	return rgnClient, isRegional, nil
 }
 
 func clusterReference(serviceSet *kcmv1.ServiceSet) *corev1.ObjectReference {
