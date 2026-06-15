@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - v1.8.0-mod
+      - v1.8.0-mod-new
 
 jobs:
   build-and-push-controller:
