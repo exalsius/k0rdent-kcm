@@ -30,8 +30,8 @@ import (
 type Poller struct {
 	client.Client
 	eventChan       chan event.GenericEvent
-	systemNamespace string
 	requeueInterval time.Duration
+	rgnClients      *regionalClientCache
 }
 
 func (p *Poller) Start(ctx context.Context) error {
@@ -70,7 +70,7 @@ func (p *Poller) pollClusterSummaries(ctx context.Context) {
 				}
 
 				serviceSet := item.DeepCopy()
-				rgnClient, _, err := getRegionalClient(ctx, p.Client, serviceSet, p.systemNamespace)
+				rgnClient, _, err := p.rgnClients.get(ctx, serviceSet)
 				if err != nil {
 					logger.V(1).Error(err, "failed to get regional client")
 					continue

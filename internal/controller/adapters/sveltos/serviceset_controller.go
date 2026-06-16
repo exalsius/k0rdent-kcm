@@ -53,10 +53,8 @@ import (
 	"github.com/K0rdent/kcm/internal/record"
 	"github.com/K0rdent/kcm/internal/serviceset"
 	helmutil "github.com/K0rdent/kcm/internal/util/helm"
-	kubeutil "github.com/K0rdent/kcm/internal/util/kube"
 	pointerutil "github.com/K0rdent/kcm/internal/util/pointer"
 	ratelimitutil "github.com/K0rdent/kcm/internal/util/ratelimit"
-	schemeutil "github.com/K0rdent/kcm/internal/util/scheme"
 )
 
 const (
@@ -114,6 +112,10 @@ type ServiceSetReconciler struct {
 
 	MaxConcurrentReconciles int
 	requeueInterval         time.Duration
+
+	// rgnClients caches one regional client per region, shared with the poller,
+	// so we don't rebuild a client (and re-run discovery) per ServiceSet per tick.
+	rgnClients *regionalClientCache
 }
 
 func (r *ServiceSetReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, err error) {
@@ -131,7 +133,7 @@ func (r *ServiceSetReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, err
 	}
 
-	rgnClient, isRegional, err := getRegionalClient(ctx, r.Client, serviceSet, r.SystemNamespace)
+	rgnClient, isRegional, err := r.rgnClients.get(ctx, serviceSet)
 	if err != nil {
 		l.Error(err, "failed to get regional client")
 		return ctrl.Result{}, err
@@ -330,11 +332,13 @@ func (r *ServiceSetReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// capacity reserve for event channel.
 	r.eventChan = make(chan event.GenericEvent, r.MaxConcurrentReconciles*10)
 
+	r.rgnClients = newRegionalClientCache(r.Client, r.SystemNamespace)
+
 	poller := &Poller{
 		Client:          r.Client,
 		requeueInterval: r.requeueInterval,
 		eventChan:       r.eventChan,
-		systemNamespace: r.SystemNamespace,
+		rgnClients:      r.rgnClients,
 	}
 
 	if err := mgr.Add(poller); err != nil {
@@ -1733,46 +1737,6 @@ func servicesStateFromSummary(
 	}
 	logger.V(1).Info("Collected services state from summary", "states", states)
 	return states
-}
-
-// getRegionalClient returns local or regional kubernetes client depending on the target cluster type.
-// getRegionalClient returns the client used to manage the ProjectSveltos objects
-// for the given ServiceSet, along with a boolean indicating whether that client
-// targets a remote regional cluster (true) rather than the local management
-// cluster (false). The distinction matters because objects created on a remote
-// regional cluster must not carry an ownerReference to the management-cluster
-// ServiceSet, which would be a dangling cross-cluster reference.
-func getRegionalClient(ctx context.Context, cl client.Client, serviceSet *kcmv1.ServiceSet, systemNamespace string) (client.Client, bool, error) {
-	if serviceSet.Spec.Cluster == "" {
-		// The ServiceSet created for self-managing the management cluster has
-		// empty .spec.cluster because it isn't matching any ClusterDeployment.
-		// So we return the management cluster client in this case.
-		return cl, false, nil
-	}
-
-	cd := new(kcmv1.ClusterDeployment)
-	cdKey := client.ObjectKey{Namespace: serviceSet.Namespace, Name: serviceSet.Spec.Cluster}
-	if err := cl.Get(ctx, cdKey, cd); err != nil {
-		return nil, false, fmt.Errorf("failed to get %s ClusterDeployment: %w", cdKey, err)
-	}
-
-	cred := new(kcmv1.Credential)
-	credKey := client.ObjectKey{Namespace: cd.Namespace, Name: cd.Spec.Credential}
-	if err := cl.Get(ctx, credKey, cred); err != nil {
-		return nil, false, fmt.Errorf("failed to get %s Credential: %w", credKey, err)
-	}
-
-	// A non-empty region means GetRegionalClientByRegionName returns a client for
-	// a separate regional cluster; an empty region means it returns the management
-	// client (see GetRegionalClientByRegionName).
-	isRegional := cred.Spec.Region != ""
-
-	rgnClient, err := kubeutil.GetRegionalClientByRegionName(ctx, cl, systemNamespace, cred.Spec.Region, schemeutil.GetRegionalSchemeWithSveltos)
-	if err != nil {
-		return nil, false, fmt.Errorf("failed to get regional client: %w", err)
-	}
-
-	return rgnClient, isRegional, nil
 }
 
 func clusterReference(serviceSet *kcmv1.ServiceSet) *corev1.ObjectReference {

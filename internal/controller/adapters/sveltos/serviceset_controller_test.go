@@ -107,6 +107,7 @@ var _ = Describe("ServiceSet Controller integration tests", Ordered, func() {
 				timeFunc:        func() time.Time { return time.Date(2025, 12, 1, 0, 0, 0, 0, time.UTC) },
 				requeueInterval: 1 * time.Second,
 			}
+			reconciler.rgnClients = newRegionalClientCache(cl, reconciler.SystemNamespace)
 		})
 	})
 
